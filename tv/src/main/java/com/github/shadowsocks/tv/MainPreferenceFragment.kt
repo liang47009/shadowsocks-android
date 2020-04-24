@@ -29,13 +29,11 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.RemoteException
 import android.text.format.Formatter
-import android.util.Log
 import android.widget.Toast
 import androidx.fragment.app.viewModels
 import androidx.leanback.preference.LeanbackPreferenceFragmentCompat
 import androidx.lifecycle.observe
 import androidx.preference.*
-import com.crashlytics.android.Crashlytics
 import com.github.shadowsocks.BootReceiver
 import com.github.shadowsocks.Core
 import com.github.shadowsocks.aidl.IShadowsocksService
@@ -44,16 +42,14 @@ import com.github.shadowsocks.aidl.TrafficStats
 import com.github.shadowsocks.bg.BaseService
 import com.github.shadowsocks.database.ProfileManager
 import com.github.shadowsocks.net.HttpsTest
-import com.github.shadowsocks.net.TcpFastOpen
 import com.github.shadowsocks.preference.DataStore
 import com.github.shadowsocks.preference.EditTextPreferenceModifiers
-import com.github.shadowsocks.preference.HostsSummaryProvider
 import com.github.shadowsocks.preference.OnPreferenceDataStoreChangeListener
 import com.github.shadowsocks.utils.Key
 import com.github.shadowsocks.utils.datas
-import com.github.shadowsocks.utils.printLog
 import com.github.shadowsocks.utils.readableMessage
 import com.google.android.gms.oss.licenses.OssLicensesMenuActivity
+import timber.log.Timber
 
 class MainPreferenceFragment : LeanbackPreferenceFragmentCompat(), ShadowsocksConnection.Callback,
         OnPreferenceDataStoreChangeListener {
@@ -61,30 +57,18 @@ class MainPreferenceFragment : LeanbackPreferenceFragmentCompat(), ShadowsocksCo
         private const val REQUEST_CONNECT = 1
         private const val REQUEST_REPLACE_PROFILES = 2
         private const val REQUEST_EXPORT_PROFILES = 3
-        private const val REQUEST_HOSTS = 4
-        private const val TAG = "MainPreferenceFragment"
     }
 
     private lateinit var fab: ListPreference
     private lateinit var stats: Preference
     private lateinit var controlImport: Preference
-    private lateinit var hosts: EditTextPreference
     private lateinit var serviceMode: Preference
-    private lateinit var tfo: SwitchPreference
     private lateinit var shareOverLan: Preference
     private lateinit var portProxy: EditTextPreference
     private lateinit var portLocalDns: EditTextPreference
     private lateinit var portTransproxy: EditTextPreference
     private val onServiceModeChange = Preference.OnPreferenceChangeListener { _, newValue ->
-        val (enabledLocalDns, enabledTransproxy) = when (newValue as String?) {
-            Key.modeProxy -> Pair(false, false)
-            Key.modeVpn -> Pair(true, false)
-            Key.modeTransproxy -> Pair(true, true)
-            else -> throw IllegalArgumentException("newValue: $newValue")
-        }
-        hosts.isEnabled = enabledLocalDns
-        portLocalDns.isEnabled = enabledLocalDns
-        portTransproxy.isEnabled = enabledTransproxy
+        portTransproxy.isEnabled = newValue as String? == Key.modeTransproxy
         true
     }
     private val tester by viewModels<HttpsTest>()
@@ -124,12 +108,11 @@ class MainPreferenceFragment : LeanbackPreferenceFragmentCompat(), ShadowsocksCo
         this.state = state
         val stopped = state == BaseService.State.Stopped
         controlImport.isEnabled = stopped
-        tfo.isEnabled = stopped
         serviceMode.isEnabled = stopped
         shareOverLan.isEnabled = stopped
         portProxy.isEnabled = stopped
+        portLocalDns.isEnabled = stopped
         if (stopped) onServiceModeChange.onPreferenceChange(null, DataStore.serviceMode) else {
-            portLocalDns.isEnabled = false
             portTransproxy.isEnabled = false
         }
     }
@@ -161,25 +144,6 @@ class MainPreferenceFragment : LeanbackPreferenceFragmentCompat(), ShadowsocksCo
             true
         }
 
-        tfo = findPreference(Key.tfo)!!
-        tfo.isChecked = DataStore.tcpFastOpen
-        tfo.setOnPreferenceChangeListener { _, value ->
-            if (value as Boolean && !TcpFastOpen.sendEnabled) {
-                val result = TcpFastOpen.enable()?.trim()
-                if (TcpFastOpen.sendEnabled) true else {
-                    Toast.makeText(requireContext(), if (result.isNullOrEmpty())
-                        getText(R.string.tcp_fastopen_failure) else result, Toast.LENGTH_SHORT).show()
-                    false
-                }
-            } else true
-        }
-        if (!TcpFastOpen.supported) {
-            tfo.isEnabled = false
-            tfo.summary = getString(R.string.tcp_fastopen_summary_unsupported, System.getProperty("os.version"))
-        }
-
-        hosts = findPreference(Key.hosts)!!
-        hosts.summaryProvider = HostsSummaryProvider
         serviceMode = findPreference(Key.serviceMode)!!
         shareOverLan = findPreference(Key.shareOverLan)!!
         portProxy = findPreference(Key.portProxy)!!
@@ -275,11 +239,6 @@ class MainPreferenceFragment : LeanbackPreferenceFragmentCompat(), ShadowsocksCo
         else -> super.onPreferenceTreeClick(preference)
     }
 
-    override fun onDisplayPreferenceDialog(preference: Preference?) {
-        if (preference != hosts || startFilesForResult(Intent(Intent.ACTION_GET_CONTENT).setType("*/*"), REQUEST_HOSTS))
-            super.onDisplayPreferenceDialog(preference)
-    }
-
     private fun startFilesForResult(intent: Intent, requestCode: Int): Boolean {
         try {
             startActivityForResult(intent.addCategory(Intent.CATEGORY_OPENABLE), requestCode)
@@ -293,7 +252,7 @@ class MainPreferenceFragment : LeanbackPreferenceFragmentCompat(), ShadowsocksCo
         when (requestCode) {
             REQUEST_CONNECT -> if (resultCode == Activity.RESULT_OK) Core.startService() else {
                 Toast.makeText(requireContext(), R.string.vpn_permission_denied, Toast.LENGTH_SHORT).show()
-                Crashlytics.log(Log.ERROR, TAG, "Failed to start VpnService from onActivityResult: $data")
+                Timber.e("Failed to start VpnService from onActivityResult: $data")
             }
             REQUEST_REPLACE_PROFILES -> {
                 if (resultCode != Activity.RESULT_OK) return
@@ -303,7 +262,7 @@ class MainPreferenceFragment : LeanbackPreferenceFragmentCompat(), ShadowsocksCo
                         context.contentResolver.openInputStream(it)
                     }.filterNotNull(), true)
                 } catch (e: Exception) {
-                    printLog(e)
+                    Timber.w(e)
                     Toast.makeText(context, e.readableMessage, Toast.LENGTH_SHORT).show()
                 }
                 populateProfiles()
@@ -317,17 +276,7 @@ class MainPreferenceFragment : LeanbackPreferenceFragmentCompat(), ShadowsocksCo
                         it.write(profiles.toString(2))
                     }
                 } catch (e: Exception) {
-                    printLog(e)
-                    Toast.makeText(context, e.readableMessage, Toast.LENGTH_SHORT).show()
-                }
-            }
-            REQUEST_HOSTS -> {
-                if (resultCode != Activity.RESULT_OK) return
-                val context = requireContext()
-                try {
-                    // we read and persist all its content here to avoid content URL permission issues
-                    hosts.text = context.contentResolver.openInputStream(data!!.data!!)!!.bufferedReader().readText()
-                } catch (e: Exception) {
+                    Timber.w(e)
                     Toast.makeText(context, e.readableMessage, Toast.LENGTH_SHORT).show()
                 }
             }

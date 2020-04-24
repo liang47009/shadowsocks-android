@@ -18,7 +18,7 @@
  *                                                                             *
  *******************************************************************************/
 
-package com.github.shadowsocks.bg
+package com.github.shadowsocks.net
 
 import android.annotation.SuppressLint
 import android.annotation.TargetApi
@@ -29,15 +29,14 @@ import android.os.CancellationSignal
 import android.os.Looper
 import android.system.ErrnoException
 import android.system.Os
-import android.system.OsConstants
 import com.github.shadowsocks.Core
-import com.github.shadowsocks.utils.closeQuietly
 import com.github.shadowsocks.utils.int
-import com.github.shadowsocks.utils.parseNumericAddress
-import com.github.shadowsocks.utils.printLog
 import kotlinx.coroutines.*
+import org.xbill.DNS.*
 import java.io.FileDescriptor
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
@@ -55,45 +54,25 @@ sealed class DnsResolverCompat {
             }
         }
 
-        /**
-         * Based on: https://android.googlesource.com/platform/frameworks/base/+/9f97f97/core/java/android/net/util/DnsUtils.java#341
-         */
-        private val address4 = "8.8.8.8".parseNumericAddress()!!
-        private val address6 = "2000::".parseNumericAddress()!!
-        suspend fun haveIpv4(network: Network) = checkConnectivity(network, OsConstants.AF_INET, address4)
-        suspend fun haveIpv6(network: Network) = checkConnectivity(network, OsConstants.AF_INET6, address6)
-        private suspend fun checkConnectivity(network: Network, domain: Int, addr: InetAddress) = try {
-            val socket = Os.socket(domain, OsConstants.SOCK_DGRAM, OsConstants.IPPROTO_UDP)
-            try {
-                instance.bindSocket(network, socket)
-                instance.connectUdp(socket, addr)
-            } finally {
-                socket.closeQuietly()
-            }
-            true
-        } catch (e: IOException) {
-            if ((e.cause as? ErrnoException)?.errno == OsConstants.EPERM) checkConnectivity(network, addr) else false
-        } catch (_: ErrnoException) {
-            false
-        } catch (e: ReflectiveOperationException) {
-            check(Build.VERSION.SDK_INT < 23)
-            printLog(e)
-            checkConnectivity(network, addr)
-        }
-        private fun checkConnectivity(network: Network, addr: InetAddress): Boolean {
-            return Core.connectivity.getLinkProperties(network)?.routes?.any {
-                try {
-                    it.matches(addr)
-                } catch (e: RuntimeException) {
-                    printLog(e)
-                    false
-                }
-            } == true
-        }
-
         override fun bindSocket(network: Network, socket: FileDescriptor) = instance.bindSocket(network, socket)
         override suspend fun resolve(network: Network, host: String) = instance.resolve(network, host)
         override suspend fun resolveOnActiveNetwork(host: String) = instance.resolveOnActiveNetwork(host)
+        override suspend fun resolveRaw(network: Network, query: ByteArray) = instance.resolveRaw(network, query)
+        override suspend fun resolveRawOnActiveNetwork(query: ByteArray) = instance.resolveRawOnActiveNetwork(query)
+
+        // additional platform-independent DNS helpers
+
+        /**
+         * TTL returned from localResolver is set to 120. Android API does not provide TTL,
+         * so we suppose Android apps should not care about TTL either.
+         */
+        private const val TTL = 120L
+
+        fun prepareDnsResponse(request: Message) = Message(request.header.id).apply {
+            header.setFlag(Flags.QR.toInt())    // this is a response
+            if (request.header.getFlag(Flags.RD.toInt())) header.setFlag(Flags.RD.toInt())
+            request.question?.also { addRecord(it, Section.QUESTION) }
+        }
     }
 
     @Throws(IOException::class)
@@ -102,6 +81,8 @@ sealed class DnsResolverCompat {
             Os.connect(fd, address, port)
     abstract suspend fun resolve(network: Network, host: String): Array<InetAddress>
     abstract suspend fun resolveOnActiveNetwork(host: String): Array<InetAddress>
+    abstract suspend fun resolveRaw(network: Network, query: ByteArray): ByteArray
+    abstract suspend fun resolveRawOnActiveNetwork(query: ByteArray): ByteArray
 
     @SuppressLint("PrivateApi")
     private open class DnsResolverCompat21 : DnsResolverCompat() {
@@ -138,6 +119,40 @@ sealed class DnsResolverCompat {
                 GlobalScope.async(unboundedIO) { network.getAllByName(host) }.await()
         override suspend fun resolveOnActiveNetwork(host: String) =
                 GlobalScope.async(unboundedIO) { InetAddress.getAllByName(host) }.await()
+
+        private suspend fun resolveRaw(query: ByteArray,
+                                       hostResolver: suspend (String) -> Array<InetAddress>): ByteArray {
+            val request = try {
+                Message(query)
+            } catch (e: IOException) {
+                throw UnsupportedOperationException(e)  // unrecognized packet
+            }
+            when (val opcode = request.header.opcode) {
+                Opcode.QUERY -> { }
+                else -> throw UnsupportedOperationException("Unsupported opcode $opcode")
+            }
+            val question = request.question
+            val isIpv6 = when (val type = question?.type) {
+                Type.A -> false
+                Type.AAAA -> true
+                else -> throw UnsupportedOperationException("Unsupported query type $type")
+            }
+            val host = question.name.canonicalize().toString(true)
+            return prepareDnsResponse(request).apply {
+                header.setFlag(Flags.RA.toInt())   // recursion available
+                for (address in hostResolver(host).asIterable().run {
+                    if (isIpv6) filterIsInstance<Inet6Address>() else filterIsInstance<Inet4Address>()
+                }) addRecord(when (address) {
+                    is Inet4Address -> ARecord(question.name, DClass.IN, TTL, address)
+                    is Inet6Address -> AAAARecord(question.name, DClass.IN, TTL, address)
+                    else -> error("Unsupported address $address")
+                }, Section.ANSWER)
+            }.toWire()
+        }
+        override suspend fun resolveRaw(network: Network, query: ByteArray) =
+                resolveRaw(query) { resolve(network, it) }
+        override suspend fun resolveRawOnActiveNetwork(query: ByteArray) =
+                resolveRaw(query, this::resolveOnActiveNetwork)
     }
 
     @TargetApi(23)
@@ -154,6 +169,8 @@ sealed class DnsResolverCompat {
 
         override fun bindSocket(network: Network, socket: FileDescriptor) = network.bindSocket(socket)
 
+        private val activeNetwork get() = Core.connectivity.activeNetwork ?: throw IOException("no network")
+
         override suspend fun resolve(network: Network, host: String): Array<InetAddress> {
             return suspendCancellableCoroutine { cont ->
                 val signal = CancellationSignal()
@@ -167,9 +184,19 @@ sealed class DnsResolverCompat {
                 })
             }
         }
+        override suspend fun resolveOnActiveNetwork(host: String) = resolve(activeNetwork, host)
 
-        override suspend fun resolveOnActiveNetwork(host: String): Array<InetAddress> {
-            return resolve(Core.connectivity.activeNetwork ?: return emptyArray(), host)
+        override suspend fun resolveRaw(network: Network, query: ByteArray): ByteArray {
+            return suspendCancellableCoroutine { cont ->
+                val signal = CancellationSignal()
+                cont.invokeOnCancellation { signal.cancel() }
+                DnsResolver.getInstance().rawQuery(network, query, DnsResolver.FLAG_NO_RETRY, this,
+                        signal, object : DnsResolver.Callback<ByteArray> {
+                    override fun onAnswer(answer: ByteArray, rcode: Int) = cont.resume(answer)
+                    override fun onError(error: DnsResolver.DnsException) = cont.resumeWithException(IOException(error))
+                })
+            }
         }
+        override suspend fun resolveRawOnActiveNetwork(query: ByteArray) = resolveRaw(activeNetwork, query)
     }
 }
